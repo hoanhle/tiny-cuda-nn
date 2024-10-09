@@ -688,7 +688,7 @@ __device__ uint32_t grid_hash(const uvec<N_DIMS>& pos_grid) {
 }
 
 template <uint32_t N_DIMS, HashType HASH_TYPE>
-__device__ uint32_t grid_index(const GridType grid_type, const uint32_t hashmap_size, const uint32_t grid_resolution, const uvec<N_DIMS>& pos_grid) {
+__device__ uint32_t grid_index(const GridType grid_type, const uint32_t hashmap_size, const tcnn::uvec<N_DIMS>& resolution, const uvec<N_DIMS>& pos_grid) {
 	uint32_t stride = 1;
 	uint32_t index = 0;
 
@@ -696,7 +696,7 @@ __device__ uint32_t grid_index(const GridType grid_type, const uint32_t hashmap_
 	TCNN_PRAGMA_UNROLL
 	for (uint32_t dim = 0; dim < N_DIMS && stride <= hashmap_size; ++dim) {
 		index += pos_grid[dim] * stride;
-		stride *= grid_resolution;
+		stride *= resolution[dim];
 	}
 
 	if (grid_type == GridType::Hash && hashmap_size < stride) {
