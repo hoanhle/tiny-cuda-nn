@@ -48,13 +48,12 @@ namespace tcnn {
 
 #define MAX_N_POS_DIMS 7
 
-__constant__ uint32_t d_base_resolution[MAX_N_POS_DIMS];
-
 template <typename T, uint32_t N_POS_DIMS, uint32_t N_FEATURES_PER_LEVEL, HashType HASH_TYPE>
 __global__ void kernel_grid(
 	const uint32_t num_elements,
 	const uint32_t num_grid_features,
 	const GridOffsetTable offset_table,
+	const uint32_t* __restrict__ d_base_resolution,
 	const float log2_per_level_scale,
 	float max_level,
 	const float* __restrict__ max_level_gpu,
@@ -224,6 +223,7 @@ __global__ void kernel_grid_backward(
 	const uint32_t num_elements,
 	const uint32_t num_grid_features,
 	const GridOffsetTable offset_table,
+	const uint32_t* __restrict__ d_base_resolution,
 	const float log2_per_level_scale,
 	float max_level,
 	const float* __restrict__ max_level_gpu,
@@ -364,6 +364,7 @@ __global__ void kernel_grid_backward_input_backward_grid(
 	const uint32_t num_elements,
 	const uint32_t num_grid_features,
 	const GridOffsetTable offset_table,
+	const uint32_t* __restrict__ d_base_resolution,
 	const float log2_per_level_scale,
 	float max_level,
 	const float* __restrict__ max_level_gpu,
@@ -473,6 +474,7 @@ __global__ void kernel_grid_backward_input_backward_input(
 	const uint32_t num_elements,
 	const uint32_t num_grid_features,
 	const GridOffsetTable offset_table,
+	const uint32_t* __restrict__ d_base_resolution,
 	const float log2_per_level_scale,
 	float max_level,
 	const float* __restrict__ max_level_gpu,
@@ -713,6 +715,9 @@ public:
 	m_interpolation_type{interpolation_type},
 	m_grid_type{grid_type}
 	{
+		cudaMalloc((void**)&d_base_resolution, sizeof(uint32_t) * N_POS_DIMS);
+		cudaMemcpy(d_base_resolution, &m_base_resolution, sizeof(uint32_t) * N_POS_DIMS, cudaMemcpyHostToDevice);
+
 		m_n_levels = div_round_up(m_n_features, N_FEATURES_PER_LEVEL);
 		uint32_t offset = 0;
 
@@ -773,8 +778,6 @@ public:
 
 		m_n_output_dims = m_n_features;
 
-		upload_base_resolution_to_device();
-
 		if (n_features % N_FEATURES_PER_LEVEL != 0) {
 			throw std::runtime_error{fmt::format("GridEncoding: n_features={} must be a multiple of N_FEATURES_PER_LEVEL={}", n_features, N_FEATURES_PER_LEVEL)};
 		}
@@ -827,10 +830,12 @@ public:
 			forward->dy_dx = GPUMatrix<float, RM>{N_POS_DIMS * m_n_features, input.n(), synced_streams.get(0)};
 		}
 
+
 		kernel_grid<T, N_POS_DIMS, N_FEATURES_PER_LEVEL, HASH_TYPE><<<blocks_hashgrid, N_THREADS_HASHGRID, 0, synced_streams.get(0)>>>(
 			num_elements,
 			m_n_features,
 			m_offset_table,
+			d_base_resolution,
 			std::log2(m_per_level_scale),
 			this->m_max_level,
 			this->m_max_level_gpu,
@@ -917,6 +922,7 @@ public:
 				num_elements,
 				m_n_features,
 				m_offset_table,
+				d_base_resolution,
 				std::log2(m_per_level_scale),
 				this->m_max_level,
 				this->m_max_level_gpu,
@@ -1011,6 +1017,7 @@ public:
 				num_elements,
 				m_n_features,
 				m_offset_table,
+				d_base_resolution,
 				std::log2(m_per_level_scale),
 				this->m_max_level,
 				this->m_max_level_gpu,
@@ -1056,6 +1063,7 @@ public:
 				num_elements,
 				m_n_features,
 				m_offset_table,
+				d_base_resolution,
 				std::log2(m_per_level_scale),
 				this->m_max_level,
 				this->m_max_level_gpu,
@@ -1172,33 +1180,13 @@ private:
 		GPUMatrix<float, RM> positions;
 		GPUMatrix<float, RM> dy_dx;
 	};
-
-	void upload_base_resolution_to_device() {
-		// Copy m_base_resolution to a host array
-		uint32_t h_base_resolution[MAX_N_POS_DIMS] = {0};
-
-		for (uint32_t i = 0; i < N_POS_DIMS; ++i) {
-			h_base_resolution[i] = m_base_resolution[i];
-		}
-
-		std::cout << "Uploading base resolution to device: " << h_base_resolution[0] << ", " << h_base_resolution[1] << ", " << h_base_resolution[2] << std::endl;
-
-		// Copy the host array to device constant memory
-		cudaMemcpyToSymbol(
-			d_base_resolution,
-			h_base_resolution,
-			N_POS_DIMS * sizeof(uint32_t),
-			0, // Offset in constant memory
-			cudaMemcpyHostToDevice
-		);
-	}
-
 	uint32_t m_n_features;
 	uint32_t m_n_levels;
 	uint32_t m_n_params;
 	GridOffsetTable m_offset_table;
 	uint32_t m_log2_hashmap_size;
 	uvec<N_POS_DIMS> m_base_resolution;
+	uint32_t* d_base_resolution;
 
 	uint32_t m_n_dims_to_pass_through;
 
@@ -1265,17 +1253,13 @@ GridEncoding<T>* create_grid_encoding_templated_2(uint32_t n_dims_to_encode, con
             } else {
                 base_resolution_2D = uvec<2>{16, 16}; // Default value
             }
-
-            #define TCNN_GRID_PARAMS \
-                n_features, \
-                log2_hashmap_size, \
-                base_resolution_2D, \
-                encoding.value("per_level_scale", grid_type == GridType::Dense ? std::exp(std::log(256.0f / static_cast<float>(base_resolution_2D[0])) / (n_levels-1)) : 2.0f), \
-                encoding.value("stochastic_interpolation", false), \
-                string_to_interpolation_type(encoding.value("interpolation", "Linear")), \
-                grid_type, \
-
-            return new GridEncodingTemplated<T, 2, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
+        	return new GridEncodingTemplated<T, 2, N_FEATURES_PER_LEVEL, HASH_TYPE>{n_features, \
+				log2_hashmap_size, \
+				base_resolution_2D, \
+				encoding.value("per_level_scale", grid_type == GridType::Dense ? std::exp(std::log(256.0f / static_cast<float>(base_resolution_2D[0])) / (n_levels-1)) : 2.0f), \
+				encoding.value("stochastic_interpolation", false), \
+				string_to_interpolation_type(encoding.value("interpolation", "Linear")), \
+				grid_type};
         }
         case 3: {
             if (encoding.contains("base_resolution")) {
@@ -1284,16 +1268,13 @@ GridEncoding<T>* create_grid_encoding_templated_2(uint32_t n_dims_to_encode, con
                 base_resolution_3D = uvec<3>{16, 16, 16}; // Default value
             }
 
-            #define TCNN_GRID_PARAMS \
-                n_features, \
-                log2_hashmap_size, \
-                base_resolution_3D, \
-                encoding.value("per_level_scale", grid_type == GridType::Dense ? std::exp(std::log(256.0f / static_cast<float>(base_resolution_3D[0])) / (n_levels-1)) : 2.0f), \
-                encoding.value("stochastic_interpolation", false), \
-                string_to_interpolation_type(encoding.value("interpolation", "Linear")), \
-                grid_type, \
-
-            return new GridEncodingTemplated<T, 3, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
+        	return new GridEncodingTemplated<T, 3, N_FEATURES_PER_LEVEL, HASH_TYPE>{n_features, \
+				log2_hashmap_size, \
+				base_resolution_3D, \
+				encoding.value("per_level_scale", grid_type == GridType::Dense ? std::exp(std::log(256.0f / static_cast<float>(base_resolution_3D[0])) / (n_levels-1)) : 2.0f), \
+				encoding.value("stochastic_interpolation", false), \
+				string_to_interpolation_type(encoding.value("interpolation", "Linear")), \
+				grid_type};
         }
         case 4: {
             if (encoding.contains("base_resolution")) {
@@ -1301,23 +1282,17 @@ GridEncoding<T>* create_grid_encoding_templated_2(uint32_t n_dims_to_encode, con
             } else {
                 base_resolution_4D = uvec<4>{16, 16, 16, 16}; // Default value
             }
-
-            #define TCNN_GRID_PARAMS \
-                n_features, \
-                log2_hashmap_size, \
-                base_resolution_4D, \
-                encoding.value("per_level_scale", grid_type == GridType::Dense ? std::exp(std::log(256.0f / static_cast<float>(base_resolution_4D[0])) / (n_levels-1)) : 2.0f), \
-                encoding.value("stochastic_interpolation", false), \
-                string_to_interpolation_type(encoding.value("interpolation", "Linear")), \
-                grid_type, \
-
-            return new GridEncodingTemplated<T, 4, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
+        	return new GridEncodingTemplated<T, 4, N_FEATURES_PER_LEVEL, HASH_TYPE>{n_features, \
+				log2_hashmap_size, \
+				base_resolution_4D, \
+				encoding.value("per_level_scale", grid_type == GridType::Dense ? std::exp(std::log(256.0f / static_cast<float>(base_resolution_4D[0])) / (n_levels-1)) : 2.0f), \
+				encoding.value("stochastic_interpolation", false), \
+				string_to_interpolation_type(encoding.value("interpolation", "Linear")), \
+				grid_type};
         }
         default:
             throw std::runtime_error{"GridEncoding: number of input dims must be 2, 3 or 4."};
     }
-
-#undef TCNN_GRID_PARAMS
 }
 
 template <typename T, HashType HASH_TYPE>
