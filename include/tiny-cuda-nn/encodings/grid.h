@@ -46,8 +46,6 @@
 
 namespace tcnn {
 
-#define MAX_N_POS_DIMS 7
-
 template <typename T, uint32_t N_POS_DIMS, uint32_t N_FEATURES_PER_LEVEL, HashType HASH_TYPE>
 __global__ void kernel_grid(
 	const uint32_t num_elements,
@@ -738,25 +736,43 @@ public:
 				resolutions[dim] = grid_resolution(scales[dim]);
 			}
 
+			std::cout << "Level " << i << ": resolutions=[" << uvec_to_string(resolutions) << "]" << std::endl;
+
+			float float_params_in_level = 1.0f;
 			uint32_t params_in_level = 1;
 
-
 			for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
-				params_in_level *= resolutions[dim];
+				float_params_in_level *= (float)resolutions[dim];
 			}
+
+			std::cout << "Level " << i << ": float_params_in_level after multiplication=" << float_params_in_level << std::endl;
 
 			uint32_t max_params = std::numeric_limits<uint32_t>::max() / 2;
-			if (params_in_level > max_params) {
+
+			if (float_params_in_level > (float)max_params) {
+				// Set params_in_level to max_params if the float comparison exceeded the limit
 				params_in_level = max_params;
+			} else {
+				// Recalculate params_in_level using integer multiplication now that it's within bounds
+				params_in_level = 1;
+				for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+					params_in_level *= resolutions[dim];
+				}
 			}
+
+			std::cout << "Level " << i << ": params_in_level after multiplication=" << params_in_level << std::endl;
+
+			auto tmp = params_in_level;
 
 			// Make sure memory accesses will be aligned
 			params_in_level = next_multiple(params_in_level, 8u);
 
+			std::cout << "Level " << i << ": params_in_level after alignment=" << params_in_level << std::endl;
+
 			if (grid_type == GridType::Dense) {
 				// No-op
 			} else if (grid_type == GridType::Tiled) {
-				params_in_level = params_in_level;
+				params_in_level = std::min(params_in_level, tmp);
 			} else if (grid_type == GridType::Hash) {
 				// If hash table needs fewer params than dense, then use fewer and rely on the hash.
 				params_in_level = std::min(params_in_level, (1u << log2_hashmap_size));
@@ -766,9 +782,6 @@ public:
 
 			m_offset_table.data[i] = offset;
 			offset += params_in_level;
-
-			log_debug("GridEncoding at level {}: resolutions=[{}], params_in_level={}",
-					  i, uvec_to_string(resolutions), params_in_level);
 		}
 
 		m_offset_table.data[m_n_levels] = offset;
